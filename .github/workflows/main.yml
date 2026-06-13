@@ -2,6 +2,7 @@ name: Build and Push to Amazon ECR
 
 on:
   push:
+    tags: ['v*'] # trigger on version tags like v1.0, v2.1, etc.
     branches:
       - main
   workflow_dispatch:
@@ -11,8 +12,27 @@ env:
   ECR_REPOSITORY: ritualroast
 
 jobs:
+  lint:
+    name: Lint PHP
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '7.4'   # match your Dockerfile's runtime
+
+      - name: Syntax-check all PHP files
+        run: |
+          # find every .php file, skip the vendored SDK, lint each one.
+          # the loop exits non-zero if any file fails → job fails → gate closes.
+          set -e
+          find . -path ./vendor -prune -o -name '*.php' -print \
+            | xargs -n1 -P4 php -l
   build-and-push:
-    name: Build image and push to ECR
+    needs: lint # ⬅️ THIS is the gate. build only runs if lint passed.
+    name: Build, tag and push image to ECR
     runs-on: ubuntu-latest
 
     steps:
@@ -31,10 +51,33 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build, tag, and push image to ECR
+        id: build
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
+          VERSION: ${{ github.ref_name }} #v1.4.2 when triggered by a tag
         run: |
-          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$ECR_REGISTRY/$ECR_REPOSITORY:$VERSION" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      # Scan the freshly built image BEFORE pushing. A CRITICAL/HIGH finding
+      # fails this step (exit-code 1), so the push step never runs and a
+      # vulnerable image can't reach ECR.
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build.outputs.image }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true # only flag vulns that have a fix available
+          exit-code: '1'
+
+      - name: Push image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          VERSION: ${{ github.ref_name }}
+        run: |
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$VERSION"
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
